@@ -27,7 +27,7 @@ M.config = {
 }
 
 --- Running jobs table to track launched presentations
---- @type table<string, number>
+--- @type table<string, number[]>
 M.running_jobs = {}
 
 --- Determines if a file is likely a Presenterm presentation
@@ -119,38 +119,130 @@ function M.launch_presenterm(file_path)
 
   local job_id = vim.fn.jobstart(term_cmd, { detach = true })
   if job_id > 0 then
-    M.running_jobs[file_path] = job_id
+    if not M.running_jobs[file_path] then
+      M.running_jobs[file_path] = {}
+    end
+    table.insert(M.running_jobs[file_path], job_id)
     vim.notify('Launched Presenterm in external terminal', vim.log.levels.INFO)
   else
     vim.notify('Failed to launch external terminal', vim.log.levels.ERROR)
   end
 end
 
+--- Stop a specific Presenterm process or all processes for a file
+--- @param file_path string|nil The path to the presentation file (optional, uses current buffer if nil)
+--- @param job_index number|nil The specific job index to stop (optional, stops all jobs for the file if nil)
+function M.stop_presenterm(file_path, job_index)
+  file_path = file_path or vim.fn.expand('%:p')
+
+  if not M.running_jobs[file_path] or #M.running_jobs[file_path] == 0 then
+    vim.notify('No running presentations found for this file', vim.log.levels.INFO)
+    return
+  end
+
+  if job_index and M.running_jobs[file_path][job_index] then
+    local job_id = M.running_jobs[file_path][job_index]
+    if M._stop_job(job_id) then
+      table.remove(M.running_jobs[file_path], job_index)
+      vim.notify('Stopped presentation instance ' .. job_index, vim.log.levels.INFO)
+    end
+  else
+    local stop_count = 0
+    for i = #M.running_jobs[file_path], 1, -1 do
+      local job_id = M.running_jobs[file_path][i]
+      if M._stop_job(job_id) then
+        stop_count = stop_count + 1
+        table.remove(M.running_jobs[file_path], i)
+      end
+    end
+
+    if stop_count > 0 then
+      vim.notify('Stopped ' .. stop_count .. ' presentation instances', vim.log.levels.INFO)
+    else
+      vim.notify('Failed to stop any presentation instances', vim.log.levels.WARN)
+    end
+  end
+
+  if #M.running_jobs[file_path] == 0 then
+    M.running_jobs[file_path] = nil
+  end
+end
+
+--- Helper function to stop a single job
+--- @param job_id number The job ID to stop
+--- @return boolean success Whether the job was successfully stopped
+function M._stop_job(job_id)
+  if type(job_id) ~= 'number' or job_id <= 0 then
+    return false
+  end
+
+  local pid
+  local pid_success, _ = pcall(function()
+    pid = vim.fn.jobpid(job_id)
+  end)
+
+  local success = pcall(vim.fn.jobstop, job_id)
+
+  if pid_success and pid and pid > 0 then
+    pcall(function()
+      if vim.fn.has('unix') == 1 then
+        vim.fn.system('pkill -P ' .. pid .. ' 2>/dev/null')
+        vim.fn.system('kill -TERM ' .. pid .. ' 2>/dev/null')
+      elseif vim.fn.has('win32') == 1 then
+        vim.fn.system('taskkill /F /T /PID ' .. pid .. ' 2>nul')
+      end
+    end)
+  end
+
+  return success
+end
+
 --- Kills all running Presenterm processes
 function M.kill_all_processes()
-  for _, job_id in pairs(M.running_jobs) do
-    if type(job_id) == 'number' and job_id > 0 then
-      pcall(vim.fn.jobstop, job_id)
+  local total_stopped = 0
 
-      local pid
-      local pid_success, _ = pcall(function()
-        pid = vim.fn.jobpid(job_id)
-      end)
-
-      if pid_success and pid and pid > 0 then
-        pcall(function()
-          if vim.fn.has('unix') == 1 then
-            vim.fn.system('pkill -P ' .. pid .. ' 2>/dev/null')
-            vim.fn.system('kill -TERM ' .. pid .. ' 2>/dev/null')
-          elseif vim.fn.has('win32') == 1 then
-            vim.fn.system('taskkill /F /T /PID ' .. pid .. ' 2>nul')
-          end
-        end)
+  for _, jobs in pairs(M.running_jobs) do
+    for _, job_id in ipairs(jobs) do
+      if M._stop_job(job_id) then
+        total_stopped = total_stopped + 1
       end
     end
   end
 
   M.running_jobs = {}
+
+  if total_stopped > 0 then
+    vim.notify('Stopped ' .. total_stopped .. ' presentation instances', vim.log.levels.INFO)
+  end
+end
+
+--- List all running presentation instances
+function M.list_presentations()
+  local count = 0
+  local output = {}
+
+  for file_path, jobs in pairs(M.running_jobs) do
+    local title = vim.fn.fnamemodify(file_path, ':t')
+    table.insert(output, title .. ' (' .. file_path .. '):')
+
+    for i, job_id in ipairs(jobs) do
+      local pid
+      pcall(function()
+        pid = vim.fn.jobpid(job_id)
+      end)
+      table.insert(output, '  ' .. i .. '. Job ID: ' .. job_id .. (pid and ', PID: ' .. pid or ''))
+      count = count + 1
+    end
+  end
+
+  if count > 0 then
+    vim.notify(
+      'Running presentations (' .. count .. '):\n' .. table.concat(output, '\n'),
+      vim.log.levels.INFO
+    )
+  else
+    vim.notify('No running presentations', vim.log.levels.INFO)
+  end
 end
 
 --- Sets up the Presenterm plugin with user configuration
@@ -162,6 +254,14 @@ function M.setup(user_config)
 
   vim.api.nvim_create_user_command('PresentermLaunch', function()
     M.launch_presenterm()
+  end, {})
+
+  vim.api.nvim_create_user_command('PresentermStop', function()
+    M.stop_presenterm()
+  end, {})
+
+  vim.api.nvim_create_user_command('PresentermList', function()
+    M.list_presentations()
   end, {})
 
   if M.config.auto_launch then
@@ -193,11 +293,7 @@ function M.setup(user_config)
     callback = function(ev)
       local file_path = ev.match
       if M.running_jobs[file_path] then
-        local job_id = M.running_jobs[file_path]
-        if job_id and type(job_id) == 'number' and job_id > 0 then
-          pcall(vim.fn.jobstop, job_id)
-        end
-        M.running_jobs[file_path] = nil
+        M.stop_presenterm(file_path)
       end
     end,
   })
